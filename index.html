@@ -1,0 +1,243 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Asistencia — Centro de Simulación</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:16px}
+  .card{max-width:620px;margin:0 auto;padding:16px;border:1px solid #ddd;border-radius:10px}
+  label{display:block;margin-top:10px;font-weight:600}
+  input,select,button{width:100%;padding:10px;border:1px solid #ccc;border-radius:8px;margin-top:6px}
+  .hint{background:#f7f7f7;padding:8px;border-radius:8px;margin-top:10px;font-size:13px}
+  .ok{color:#0b7a3b;font-weight:700}.warn{color:#b85c00;font-weight:700}.err{color:#a40000;font-weight:700}
+  button[disabled]{opacity:.6;cursor:not-allowed}
+  .diag{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;border:1px dashed #ccc;padding:8px;border-radius:8px;margin-top:10px}
+</style>
+
+<div class="card">
+  <h2>Registro de Asistencia — Centro de Simulación</h2>
+
+  <div id="diag" class="diag">Diagnóstico inicial…</div>
+
+  <label for="materia">Materia</label>
+  <select id="materia"></select>
+
+  <div style="display:flex;gap:12px">
+    <div style="flex:1">
+      <label for="legajo">Legajo</label>
+      <input id="legajo" placeholder="12345" autocomplete="off">
+    </div>
+    <div style="flex:1">
+      <label for="nombre">Nombre y Apellido</label>
+      <input id="nombre" placeholder="Ana Pérez" autocomplete="off">
+    </div>
+  </div>
+
+  <div id="geo" class="hint">1) Tocá “Activar ubicación”.</div>
+  <button id="ask">Activar ubicación</button>
+
+  <button id="btn" disabled>Registrar asistencia</button>
+  <p id="msg"></p>
+</div>
+
+<script>
+/* ====== CONFIG ====== */
+const API = "https://script.google.com/macros/s/AKfycbwy2yMtUL-9wJt59jMqDZY1x1udH00oUICE3WKNxQVSKoewYMTckwtGACxStJv2Dnoi/exec";
+const MATERIAS_FALLBACK = [
+  {id:"SANNA", nombre:"SANNA"},
+  {id:"MICC1", nombre:"MICC 1"}
+];
+
+/* ====== UI refs ====== */
+const diag = document.getElementById('diag');
+const sel  = document.getElementById('materia');
+const geo  = document.getElementById('geo');
+const ask  = document.getElementById('ask');
+const btn  = document.getElementById('btn');
+const msg  = document.getElementById('msg');
+
+const params = new URLSearchParams(location.search);
+const pre    = params.get('materiaId');
+
+let coords = null;
+let materias = [];
+let cfg = null;
+let publicIP = null;
+
+/* ====== helpers ====== */
+function logd(line){ diag.textContent += "\n" + line; }
+function haversine(lat1, lon1, lat2, lon2){
+  const R=6371000, toRad=x=>x*Math.PI/180;
+  const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+  const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(a));
+}
+/* JSONP helper */
+function jsonp(url){
+  return new Promise((resolve, reject)=>{
+    const cb = '__cb_' + Math.random().toString(36).slice(2);
+    const cleanup = () => { delete window[cb]; if (script && script.parentNode) script.parentNode.removeChild(script); };
+    window[cb] = (data) => { cleanup(); resolve(data); };
+    const script = document.createElement('script');
+    script.src = url + (url.includes('?')?'&':'?') + 'callback=' + cb;
+    script.onerror = () => { cleanup(); reject(new Error('JSONP load error')); };
+    document.head.appendChild(script);
+  });
+}
+
+/* ====== IP pública (robusto con timeouts y fallbacks) ====== */
+async function getPublicIP(timeoutMs = 2500) {
+  const withTimeout = (p, ms) =>
+    Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
+  const providers = [
+    async () => {
+      const r = await withTimeout(fetch('https://api.ipify.org?format=json'), timeoutMs);
+      if (!r.ok) throw new Error('ipify failed');
+      const { ip } = await r.json();
+      return ip;
+    },
+    async () => {
+      const r = await withTimeout(fetch('https://www.cloudflare.com/cdn-cgi/trace'), timeoutMs);
+      if (!r.ok) throw new Error('cloudflare failed');
+      const txt = await r.text();
+      const m = txt.match(/ip=([^\n]+)/);
+      if (!m) throw new Error('cloudflare parse');
+      return m[1];
+    },
+    async () => {
+      const r = await withTimeout(fetch('https://ipapi.co/json/'), timeoutMs);
+      if (!r.ok) throw new Error('ipapi failed');
+      const { ip } = await r.json();
+      if (!ip) throw new Error('ipapi parse');
+      return ip;
+    }
+  ];
+
+  for (const p of providers) {
+    try { return await p(); } catch (_) { /* probar siguiente */ }
+  }
+  return null;
+}
+
+/* ====== Diagnóstico ====== */
+async function ping(){
+  try{
+    const r = await fetch(API + '?ping=1');
+    const t = await r.text();
+    logd("Ping: " + r.status + " -> " + t);
+  }catch(e){
+    logd("Ping ERROR: " + e);
+  }
+}
+async function loadConfig(){
+  try{
+    const r = await fetch(API + '?action=config');
+    if (!r.ok) throw new Error("HTTP "+r.status);
+    cfg = await r.json();
+    logd("Config OK: radius="+cfg.radiusMeters+" center=("+cfg.centerLat+","+cfg.centerLng+")");
+  }catch(e){
+    cfg = null; logd("Config FALLÓ: " + e);
+  }
+}
+async function loadMaterias(){
+  try{
+    const r = await fetch(API + '?action=materias');
+    if (!r.ok) throw new Error("HTTP "+r.status);
+    const arr = await r.json();
+    materias = Array.isArray(arr)&&arr.length ? arr : MATERIAS_FALLBACK.slice();
+    logd("Materias OK: " + materias.length);
+  }catch(e){
+    materias = MATERIAS_FALLBACK.slice();
+    logd("Materias FALLÓ, usando fallback ("+materias.length+"): " + e);
+  }
+  sel.innerHTML='';
+  materias.forEach(m=>{
+    const o=document.createElement('option');
+    o.value=m.id; o.textContent=`${m.id} — ${m.nombre}`;
+    sel.appendChild(o);
+  });
+  if (pre && materias.find(m=>m.id===pre)) sel.value=pre;
+}
+
+/* ====== Geolocalización ====== */
+ask.onclick = () => {
+  if (!('geolocation' in navigator)) {
+    geo.textContent='Tu navegador no soporta geolocalización.'; geo.className='hint err'; return;
+  }
+  navigator.geolocation.getCurrentPosition(
+    p => {
+      coords = { lat:p.coords.latitude, lng:p.coords.longitude, accuracy:p.coords.accuracy };
+      if (cfg && typeof cfg.centerLat==='number' && typeof cfg.centerLng==='number') {
+        const dist = haversine(cfg.centerLat, cfg.centerLng, coords.lat, coords.lng);
+        const eff  = Math.max(0, dist - (coords.accuracy||0));
+        const rad  = cfg.radiusMeters || 150;
+        geo.textContent = `Ubicación OK (±${Math.round(coords.accuracy)} m). Distancia≈ ${Math.round(dist)} m (efectiva≈ ${Math.round(eff)} m) — Radio ${rad} m.`;
+      } else {
+        geo.textContent = `Ubicación OK (±${Math.round(coords.accuracy)} m).`;
+      }
+      geo.className='hint ok';
+      btn.disabled=false;
+    },
+    e => {
+      geo.textContent = 'No pudimos obtener ubicación: ' + e.message +
+        '. En iPhone: Ajustes → Privacidad → Localización → Safari → “Mientras se usa” + “Ubicación precisa”.';
+      geo.className='hint err';
+      btn.disabled=true;
+    },
+    { enableHighAccuracy:true, timeout:15000, maximumAge:0 }
+  );
+};
+
+/* ====== Envío SIN CORS (JSONP GET) ====== */
+btn.onclick = async () => {
+  const legajo = document.getElementById('legajo').value.trim();
+  const nombre = document.getElementById('nombre').value.trim();
+  const materiaId = sel.value;
+  const materiaNombre = (materias.find(m=>m.id===materiaId)||{}).nombre || '';
+
+  if (!coords) { msg.textContent='Activá la ubicación primero.'; msg.className='warn'; return; }
+  if (!legajo || !nombre || !materiaId) { msg.textContent='Completá todos los campos.'; msg.className='warn'; return; }
+
+  try{
+    btn.disabled=true; btn.textContent='Registrando…';
+
+    const payload = encodeURIComponent(JSON.stringify({
+      materiaId, materiaNombre, legajo, nombre,
+      lat:coords.lat, lng:coords.lng, accuracy:coords.accuracy,
+      userAgent:navigator.userAgent,
+      ip: publicIP || null          // <<<<<< ENVÍA IP
+    }));
+
+    const url = `${API}?action=reg&payload=${payload}`;
+    const j = await jsonp(url); // ← sin CORS
+
+    msg.textContent = j.duplicate ? j.message :
+      `${j.message} [${j.estado}]` +
+      (j.distancia_m!=null ? ` — dist=${j.distancia_m}m, acc=±${j.accuracy_m}m, eff=${j.distancia_efectiva_m}m / radio=${j.radius_m}m` : '');
+    msg.className = j.ok ? 'ok' : 'warn';
+  }catch(err){
+    msg.textContent = 'Error de red: ' + err;
+    msg.className = 'err';
+    logd("REG JSONP ERROR: " + err);
+  }finally{
+    btn.disabled=false; btn.textContent='Registrar asistencia';
+  }
+};
+
+/* init */
+(async function(){
+  diag.textContent = "Diagnóstico inicial:";
+  await ping();
+  await loadConfig();
+  await loadMaterias();
+
+  // Precargar IP en paralelo (no bloquea nada)
+  try {
+    publicIP = await getPublicIP();
+    logd("IP: " + (publicIP || "no disponible"));
+  } catch(e) {
+    publicIP = null;
+    logd("IP FALLÓ: " + e);
+  }
+})();
+</script>
